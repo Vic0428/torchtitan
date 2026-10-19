@@ -452,6 +452,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             parallelism_context=self.parallelism_context,
             training_steps=self.config.training.steps,
             pp_has_last_stage=self.pp_has_last_stage,
+            cuda_graph_annotation_config=self.config.profiler.maybe_cuda_graph_annotation_config(),
         )
         self.model_cls._register_optimizer_hooks(
             self.optim.optimizers,
@@ -552,6 +553,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 if self.parallelism_context.pp_enabled
                 else None,
                 name="forward_backward",
+                annotation_config=self.config.profiler.maybe_cuda_graph_annotation_config(),
             )
 
             # TODO: Use multiple CUDA graphs to support variable group counts
@@ -595,6 +597,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             if self.parallelism_context.pp_enabled
             else None,
             name="forward_backward",
+            annotation_config=self.config.profiler.maybe_cuda_graph_annotation_config(),
         )
 
     @sl.log_trace_span("forward_backward")
