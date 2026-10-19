@@ -18,7 +18,7 @@ count of every tensor is known before the graph runs.
 
 ## Run
 
-Both commands need a PyTorch nightly that has the APIs graph_trainer uses.
+All commands need a PyTorch nightly that has the APIs graph_trainer uses.
 Run them from the repo root.
 
 ```bash
