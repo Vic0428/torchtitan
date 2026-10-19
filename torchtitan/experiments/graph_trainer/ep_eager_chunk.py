@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -25,7 +24,9 @@ from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
     validate_ep_overlap_config,
 )
+from torchtitan.experiments.graph_trainer.simple_fsdp import _cached_unshard_parameters
 from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.moe.token_dispatcher import HybridEPTokenDispatcher
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +50,12 @@ class _EagerChunkedForward:
 
     def __init__(
         self,
-        inner_forward: Callable[..., torch.Tensor],
+        module: MoE,
         *,
         root_fqn: str,
     ) -> None:
-        self.inner_forward = inner_forward
+        self.inner_forward = module.forward
+        self.module = module
         self.root_fqn = root_fqn
 
     def __call__(
@@ -111,20 +113,21 @@ class _EagerChunkedForward:
             )
         )
         outputs = []
-        for chunk_id in (0, 1):
-            body = annotate_fn(
-                {
-                    "chunk_id": chunk_id,
-                    "chunked_region_fqn": self.root_fqn,
-                    "chunked_region_role": "body",
-                }
-            )(self.inner_forward)
-            kwargs = dict(router_kwargs)
-            if masks[chunk_id] is not None:
-                kwargs["padding_mask_T"] = masks[chunk_id]
-            if aux_loss_denominator is not None:
-                kwargs["aux_loss_denominator"] = aux_loss_denominator
-            outputs.append(body(inputs[chunk_id], **kwargs))
+        with _cached_unshard_parameters(self.module):
+            for chunk_id in (0, 1):
+                body = annotate_fn(
+                    {
+                        "chunk_id": chunk_id,
+                        "chunked_region_fqn": self.root_fqn,
+                        "chunked_region_role": "body",
+                    }
+                )(self.inner_forward)
+                kwargs = dict(router_kwargs)
+                if masks[chunk_id] is not None:
+                    kwargs["padding_mask_T"] = masks[chunk_id]
+                if aux_loss_denominator is not None:
+                    kwargs["aux_loss_denominator"] = aux_loss_denominator
+                outputs.append(body(inputs[chunk_id], **kwargs))
 
         materialize = annotate_fn(
             {
@@ -146,8 +149,14 @@ def maybe_apply_ep_overlap_eager_chunking(
     matched = []
     for fqn, module in model.named_modules():
         if isinstance(module, MoE) and matches_module_fqn_pattern(module_fqn, fqn):
+            dispatcher = module.routed_experts.token_dispatcher
+            if not isinstance(dispatcher, HybridEPTokenDispatcher):
+                raise ValueError(f"EP overlap requires HybridEP in {fqn}")
+            if dispatcher.non_blocking_capacity_factor is None:
+                raise ValueError(f"EP overlap requires non-blocking HybridEP in {fqn}")
+            dispatcher.async_op = True
             if not isinstance(module.forward, _EagerChunkedForward):
-                module.forward = _EagerChunkedForward(module.forward, root_fqn=fqn)
+                module.forward = _EagerChunkedForward(module, root_fqn=fqn)
             matched.append(fqn)
     if not matched:
         raise ValueError(
@@ -169,6 +178,4 @@ def populate_eager_chunk_metadata_pass(
         for key in ("chunk_id", "chunked_region_fqn", "chunked_region_role"):
             if key in custom:
                 node.meta[key] = custom[key]
-        if "chunked_region_role" in node.meta:
-            node.meta["chunked_region_producer"] = "eager"
     return gm

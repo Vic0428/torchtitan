@@ -58,9 +58,6 @@ class ChunkBody:
 
     owner: ChunkOwner
     nodes: tuple[fx.Node, ...]
-    node_set: frozenset[fx.Node]
-    live_ins: frozenset[fx.Node]
-    producer: str
 
 
 @dataclass(frozen=True)
@@ -84,14 +81,11 @@ def _chunk_owner(node: fx.Node) -> ChunkOwner | None:
         return None
     chunk_id = get_meta("chunk_id")
     root = get_meta("chunked_region_fqn")
-    is_backward = get_meta("chunked_region_is_backward")
     if chunk_id not in (0, 1) or not isinstance(root, str):
         raise ValueError(f"Chunk body node {node.name} has incomplete chunk metadata.")
     return ChunkOwner(
         root_fqn=root,
-        is_backward=bool(
-            is_backward if is_backward is not None else _is_backward_node(node)
-        ),
+        is_backward=_is_backward_node(node),
         chunk_id=chunk_id,
     )
 
@@ -101,8 +95,6 @@ def _clear_chunk_ownership(nodes: Iterable[fx.Node]) -> None:
     keys = (
         "chunk_id",
         "chunked_region_fqn",
-        "chunked_region_is_backward",
-        "chunked_region_producer",
         "chunked_region_role",
     )
     for node in nodes:
@@ -128,18 +120,9 @@ def collect_chunked_regions(
 
     grouped: dict[tuple[str, bool], dict[int, ChunkBody]] = defaultdict(dict)
     for owner, nodes in nodes_by_owner.items():
-        node_set = frozenset(nodes)
         grouped[(owner.root_fqn, owner.is_backward)][owner.chunk_id] = ChunkBody(
             owner=owner,
             nodes=tuple(nodes),
-            node_set=node_set,
-            live_ins=frozenset(
-                inp
-                for node in nodes
-                for inp in node.all_input_nodes
-                if inp not in node_set
-            ),
-            producer=str(nodes[0].meta.get("chunked_region_producer", "eager")),
         )
 
     return [
