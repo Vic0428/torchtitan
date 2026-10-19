@@ -970,15 +970,18 @@ class HybridEPTokenDispatcher(BaseEPTokenDispatcher):
                 A finite positive float enables CPU-free non-blocking dispatch.
                 The output row budget is input_tokens * ep_size *
                 min(num_local_experts, top_k) * capacity_factor, aligned to
-                pad_multiple when provided. Native token dropping is
+                pad_multiple when provided. Eager overlap divides the configured
+                full-call budget between chunks; factor 4 therefore gives each
+                chunk factor 2 against the same full-call token bound. The
+                configuration is never mutated. Native token dropping is
                 reported through a sticky device-side overflow flag.
 
                 - None = blocking mode (default).  HybridEP calls
                   cudaStreamSynchronize after dispatch, copies
                   tokens_per_expert to pinned CPU memory, and computes the
                   exact num_permuted_tokens on the host.  No token dropping.
-                - 1.0 = non-blocking, worst-case sizing: every token can reach
-                  every local expert, no drops, highest memory.
+                - 1.0 = non-blocking, worst-case unaligned routing capacity.
+                  Per-expert padding may still consume additional capacity.
                 - < 1.0 = non-blocking, reduced memory; controls the
                   fused-permute output tensor size (num_permuted_tokens).
                   Safe in practice when forced load balancing (e.g. aux-loss /
