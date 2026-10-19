@@ -214,7 +214,7 @@ import operator
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING, TypeVar
 
 import torch
 import torch.nn as nn
@@ -231,6 +231,7 @@ from torch.distributed.pipelining.schedules import (
 )
 from torch.distributed.tensor import DTensor
 from torch.fx import has_side_effect, Node
+from torch.fx.operator_schemas import normalize_function
 from torch.fx.traceback import annotate_fn
 from torch.utils.checkpoint import CheckpointPolicy
 
@@ -761,6 +762,12 @@ class StashSlot:
     # activation is live exactly as long as its stage's microbatch is in flight,
     # and different stages hold different numbers of microbatches.
     stage_index: int = 0
+    chunk_id: int | None = None
+
+    @property
+    def group(self) -> tuple[int, int | None]:
+        """Layer and eager chunk owning this activation's live-token count."""
+        return self.layer_id, self.chunk_id
 
     @property
     def key(self) -> tuple[torch.dtype, int]:
@@ -1716,6 +1723,7 @@ def stash_(
     num_tokens: torch.Tensor,
     slot_id: int,
     prefetch: int = 0,
+    dependencies: list[torch.Tensor] | None = None,
 ) -> None:
     """Copy the live rows of ``activation`` into the paged stash, into ``handle``.
 
@@ -1740,7 +1748,11 @@ def stash_(
     ``prefetch`` is nonzero on a layer's last stash, where Megatron's group
     commit runs: once the layer's copies are launched, the reloads of every
     backward among the next ``prefetch`` schedule entries start.
+
+    ``dependencies`` carries graph-visible queue order and storage lifetimes;
+    the runtime does not read its tensor values.
     """
+    del dependencies
     manager = PagedStashManager.get_instance()
     slot = _slot(slot_id)
 
@@ -1783,6 +1795,7 @@ def _stash_fake(
     num_tokens: torch.Tensor,
     slot_id: int,
     prefetch: int = 0,
+    dependencies: list[torch.Tensor] | None = None,
 ) -> None:
     return None
 
@@ -1794,13 +1807,18 @@ def reload(
     slot_id: int,
     size: list[int],
     dtype: torch.dtype,
+    dependencies: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Restore a stashed activation from its pages.
 
     Hands back the tensor a prefetch already started filling, or pops the pages
     now if nothing was prefetched (see ``_launch_reload``); a stash that stayed
     resident hands back the activation itself.
+
+    ``dependencies`` preserves queue order and outstanding stash input
+    lifetimes until this call joins their copies.
     """
+    del dependencies
     manager = PagedStashManager.get_instance()
     slot = _slot(slot_id)
 
@@ -1834,6 +1852,7 @@ def _reload_fake(
     slot_id: int,
     size: list[int],
     dtype: torch.dtype,
+    dependencies: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     return torch.empty(size, dtype=dtype, device=handle.device)
 
@@ -1844,35 +1863,52 @@ def _reload_fake(
 # what places each one: the consumers of that value run after it, and in GraphPP
 # it lands in the callable whose outputs depend on that value.
 _lib = torch.library.Library("paged_stash", "FRAGMENT")
-_lib.define("group_start(Tensor(a) tensor) -> Tensor(a)")
-_lib.define("wait_reload(Tensor(a) tensor) -> Tensor(a)")
-_lib.define("reload_next(Tensor(a) tensor, int slot_id, int count) -> Tensor(a)")
+_lib.define(
+    "group_start(Tensor(a) tensor, Tensor[]? dependencies=None) -> Tensor(a)",
+)
+_lib.define(
+    "wait_reload(Tensor(a) tensor, Tensor[]? dependencies=None) -> Tensor(a)",
+)
+_lib.define(
+    "reload_next(Tensor(a) tensor, int slot_id, int count, "
+    "Tensor[]? dependencies=None) -> Tensor(a)",
+)
 
 
 @torch.library.impl("paged_stash::group_start", "CompositeExplicitAutograd")
-def _paged_stash_group_start(tensor: torch.Tensor) -> torch.Tensor:
+def _paged_stash_group_start(
+    tensor: torch.Tensor, dependencies: list[torch.Tensor] | None = None
+) -> torch.Tensor:
     """Megatron's ``paged_stash_group_start``: join the copies still in flight
     before the expert MLP reads ``tensor``, which frees the padded activations
     they read."""
+    del dependencies
     PagedStashManager.get_instance().join_stashes()
     return tensor
 
 
 @torch.library.impl("paged_stash::wait_reload", "CompositeExplicitAutograd")
-def _paged_stash_wait_reload(tensor: torch.Tensor) -> torch.Tensor:
+def _paged_stash_wait_reload(
+    tensor: torch.Tensor, dependencies: list[torch.Tensor] | None = None
+) -> torch.Tensor:
     """Join the side stream into compute before backward reads the reload."""
+    del dependencies
     _wait_for_copy(tensor)
     return tensor
 
 
 @torch.library.impl("paged_stash::reload_next", "CompositeExplicitAutograd")
 def _paged_stash_reload_next(
-    tensor: torch.Tensor, slot_id: int, count: int
+    tensor: torch.Tensor,
+    slot_id: int,
+    count: int,
+    dependencies: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Megatron's ``PipelinePreScheduleFunction.backward``: once the expert
     MLP's backward has produced ``tensor``, the gradient of its input, start the
     reloads of every backward among the next ``count`` schedule entries.
     ``slot_id`` is any of the layer's slots; it names the layer."""
+    del dependencies
     manager = PagedStashManager.get_instance()
     entry = manager.backward_entry(_slot(slot_id)) if manager.active else None
     if entry is not None:
@@ -1881,18 +1917,25 @@ def _paged_stash_reload_next(
 
 
 @torch.library.register_fake("paged_stash::group_start")
-def _paged_stash_group_start_fake(tensor: torch.Tensor) -> torch.Tensor:
+def _paged_stash_group_start_fake(
+    tensor: torch.Tensor, dependencies: list[torch.Tensor] | None = None
+) -> torch.Tensor:
     return tensor
 
 
 @torch.library.register_fake("paged_stash::wait_reload")
-def _paged_stash_wait_reload_fake(tensor: torch.Tensor) -> torch.Tensor:
+def _paged_stash_wait_reload_fake(
+    tensor: torch.Tensor, dependencies: list[torch.Tensor] | None = None
+) -> torch.Tensor:
     return tensor
 
 
 @torch.library.register_fake("paged_stash::reload_next")
 def _paged_stash_reload_next_fake(
-    tensor: torch.Tensor, slot_id: int, count: int
+    tensor: torch.Tensor,
+    slot_id: int,
+    count: int,
+    dependencies: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     return tensor
 
@@ -1988,6 +2031,17 @@ PAGED_STASH_TAG = "paged_stash"
 
 # node.meta["custom"] key marking the paged-stash region.
 PAGED_STASH_REGION = "paged_stash_region"
+_PAGING_OPERATION = "paged_stash_operation"
+_StashGroup = tuple[int, int | None]
+
+
+def _stash_group(node: Node) -> _StashGroup:
+    """Read layer/chunk identity from explicit eager ownership annotations."""
+    from torchtitan.experiments.graph_trainer.ep_pass_utils import _chunk_owner
+
+    owner = _chunk_owner(node)
+    return _get_layer_id(node), None if owner is None else owner.chunk_id
+
 
 # Default module-FQN pattern of the paged-stash region: the routed experts, so
 # the region holds the dispatcher's output and everything inside
@@ -2016,6 +2070,7 @@ class TokenCounts:
     padded: int
     per_expert_node: Node
     hidden_node: Node
+    dispatch_node: Node
 
 
 def _dispatch_token_count_output(node: Node) -> int | None:
@@ -2027,14 +2082,42 @@ def _dispatch_token_count_output(node: Node) -> int | None:
     """
     target = node.target
     if target is torch.ops.hybridep.dispatch.default:
-        # (hidden, scores, tokens_per_expert, handle)
+        # (hidden, scores, tokens_per_expert, handle, completion)
         return 2
     return None
 
 
-def find_layer_token_counts(gm: torch.fx.GraphModule) -> dict[int, TokenCounts]:
-    """Map each MoE layer to its padded capacity and live-token-count node."""
-    counts: dict[int, TokenCounts] = {}
+def _exchange_wait(launch: Node) -> Node | None:
+    """Find an async HybridEP launch's unique explicit completion wait."""
+    assert isinstance(launch.target, torch._ops.OpOverload)
+    arguments = normalize_function(
+        launch.target, launch.args, launch.kwargs, normalize_to_only_use_kwargs=True
+    )
+    assert arguments is not None, f"Invalid HybridEP arguments on {launch.name}"
+    if not arguments.kwargs["async_op"]:
+        return None
+    request_index = len(launch.target._schema.returns) - 1
+    requests = [
+        user
+        for user in launch.users
+        if user.target is operator.getitem and user.args[1] == request_index
+    ]
+    waits = [
+        user
+        for request in requests
+        for user in request.users
+        if user.target is torch.ops.hybridep.wait.default and user.args[1] is request
+    ]
+    if len(waits) != 1:
+        raise ValueError(
+            f"Paged stash requires one HybridEP completion wait for {launch.name}"
+        )
+    return waits[0]
+
+
+def find_layer_token_counts(gm: torch.fx.GraphModule) -> dict[_StashGroup, TokenCounts]:
+    """Map each layer/chunk to completion-ready hidden data and device counts."""
+    counts: dict[_StashGroup, TokenCounts] = {}
     for node in gm.graph.nodes:
         if node.op != "call_function" or _is_backward_node(node):
             continue
@@ -2045,9 +2128,10 @@ def find_layer_token_counts(gm: torch.fx.GraphModule) -> dict[int, TokenCounts]:
         if layer_id == _NOT_IN_LAYERS:
             continue
 
+        outputs = _exchange_wait(node) or node
         hidden_node: Node | None = None
         per_expert_node: Node | None = None
-        for user in node.users:
+        for user in outputs.users:
             if user.target is not operator.getitem:
                 continue
             if user.args[1] == 0:
@@ -2064,11 +2148,15 @@ def find_layer_token_counts(gm: torch.fx.GraphModule) -> dict[int, TokenCounts]:
             # A symbolic permuted dimension means the dispatcher is in blocking
             # mode and already sizes exactly; nothing to page.
             continue
-        counts[layer_id] = TokenCounts(
+        group = _stash_group(node)
+        if group in counts:
+            raise ValueError(f"Duplicate HybridEP dispatch for paged group {group}")
+        counts[group] = TokenCounts(
             layer_id=layer_id,
             padded=int(padded),
             per_expert_node=per_expert_node,
             hidden_node=hidden_node,
+            dispatch_node=node,
         )
     return counts
 
@@ -2258,7 +2346,7 @@ def tag_paged_stash_activations(
     for node in gm.graph.nodes:
         if PAGED_STASH_REGION not in node.meta.get("custom", {}):
             continue
-        counts = token_counts.get(_get_layer_id(node))
+        counts = token_counts.get(_stash_group(node))
         if counts is None or not _is_pageable(node, counts.padded):
             continue
         _, has_backward = _get_storage_chain(node, is_view=_is_stash_view)
@@ -2283,7 +2371,7 @@ def tag_paged_stash_activations(
                 "  layer %d: %d tagged, padded tokens %d",
                 layer_id,
                 per_layer[layer_id],
-                token_counts[layer_id].padded,
+                max(c.padded for key, c in token_counts.items() if key[0] == layer_id),
             )
     else:
         logger.info("Paged stash: no activations in the paged-stash region")
@@ -2365,9 +2453,7 @@ def _make_num_tokens_node(
     val = per_expert_node.meta.get("val")
     with gm.graph.inserting_after(per_expert_node):
         node = gm.graph.call_function(aten.sum.default, args=(per_expert_node,))
-    node.meta.update(
-        {k: v for k, v in per_expert_node.meta.items() if k not in ("val", "recompute")}
-    )
+    node.meta.update(_meta_from(per_expert_node))
     if isinstance(val, torch.Tensor):
         node.meta["val"] = val.sum()
     # This is a forward value even though backward reads it.
@@ -2378,7 +2464,7 @@ def _make_num_tokens_node(
 def _plan_stashes(
     gm: torch.fx.GraphModule,
     tagged: list[Node],
-    token_counts: dict[int, TokenCounts],
+    token_counts: dict[_StashGroup, TokenCounts],
 ) -> tuple[list[_StashPlan], dict[Node, int]]:
     """Register a stash slot for every tagged node that backward reads.
 
@@ -2387,24 +2473,25 @@ def _plan_stashes(
     """
     manager = PagedStashManager.get_instance()
 
-    # One live-token-count node per MoE layer, shared by every stash in it.
-    num_tokens_nodes: dict[int, Node] = {}
-    for layer_id in sorted({_get_layer_id(n) for n in tagged}):
-        counts = token_counts.get(layer_id)
+    # Counts belong to one dispatch, not to both chunks of a layer.
+    num_tokens_nodes: dict[_StashGroup, Node] = {}
+    for group in dict.fromkeys(_stash_group(n) for n in tagged):
+        counts = token_counts.get(group)
         if counts is None:
             raise RuntimeError(
-                f"paged stash: layer {layer_id} has tagged activations but no "
+                f"paged stash: group {group} has tagged activations but no "
                 "token-count node; tag_paged_stash_activations and "
                 "apply_paged_stash_pass disagree about the dispatcher."
             )
-        num_tokens_nodes[layer_id] = _make_num_tokens_node(gm, counts.per_expert_node)
+        num_tokens_nodes[group] = _make_num_tokens_node(gm, counts.per_expert_node)
     node_to_index = {n: i for i, n in enumerate(gm.graph.nodes)}
 
     plans: list[_StashPlan] = []
     for node in tagged:
         val = node.meta["val"]
         layer_id = _get_layer_id(node)
-        padded = token_counts[layer_id].padded
+        group = _stash_group(node)
+        padded = token_counts[group].padded
         dims = _slot_dims(node, padded)
         if dims is None:
             # tag_paged_stash_activations only tags nodes with slot dims, so
@@ -2427,6 +2514,7 @@ def _plan_stashes(
             layer_id=layer_id,
             node_name=node.name,
             stage_index=manager.current_stage_index,
+            chunk_id=group[1],
         )
         manager.register_slot(slot)
         logger.debug(
@@ -2446,7 +2534,7 @@ def _plan_stashes(
             _StashPlan(
                 offload=offload,
                 slot=slot,
-                num_tokens_node=num_tokens_nodes[layer_id],
+                num_tokens_node=num_tokens_nodes[group],
             )
         )
     return plans, node_to_index
@@ -2454,8 +2542,8 @@ def _plan_stashes(
 
 def _stash_group_commits(
     plans: list[_StashPlan], node_to_index: dict[Node, int]
-) -> dict[int, Node]:
-    """Per layer, the latest of its stashed activations and their token counts.
+) -> dict[_StashGroup, Node]:
+    """Per dispatch, the latest saved activation or completion-ready count.
 
     That is where the layer's stashes launch, together: once the expert MLP has
     produced everything it saves, as Megatron's ``paged_stash_group_commit``
@@ -2463,12 +2551,12 @@ def _stash_group_commits(
     activation exists would put it alongside the expert GEMMs, and a copy
     kernel occupies every SM while it runs.
     """
-    commits: dict[int, Node] = {}
+    commits: dict[_StashGroup, Node] = {}
     for plan in plans:
         for candidate in (plan.offload.node, plan.num_tokens_node):
-            current = commits.get(plan.slot.layer_id)
+            current = commits.get(plan.slot.group)
             if current is None or node_to_index[candidate] > node_to_index[current]:
-                commits[plan.slot.layer_id] = candidate
+                commits[plan.slot.group] = candidate
     return commits
 
 
@@ -2476,10 +2564,29 @@ def _meta_from(node: Node) -> dict[str, Any]:
     """``node``'s metadata minus what describes its value or its tagging, so
     the ops inserted for it are attributed to the same module in tlparse dumps
     and kernel annotations."""
-    return {
+    meta = {
         k: v
         for k, v in node.meta.items()
         if k not in ("val", "recompute", PAGED_STASH_TAG)
+    }
+    from torchtitan.distributed.deepep.hybridep import (
+        _EP_TOKEN_EXCHANGE,
+        _EP_TOKEN_EXCHANGE_WAIT,
+    )
+
+    meta["custom"] = {
+        **meta.get("custom", {}),
+        _EP_TOKEN_EXCHANGE: None,
+        _EP_TOKEN_EXCHANGE_WAIT: None,
+    }
+    return meta
+
+
+def _annotate_paging(node: Node, operation: str) -> None:
+    """Set an inserted operation's role after _meta_from clears EP tags."""
+    node.meta["custom"] = {
+        **node.meta.get("custom", {}),
+        _PAGING_OPERATION: operation,
     }
 
 
@@ -2489,13 +2596,16 @@ def _insert_stash_ops(
     *,
     page_size: int,
     prefetch: int,
+    commit: Node,
     insert_after: Node,
 ) -> tuple[Node, Node]:
     """Insert the forward stash and backward reload for ``plan``.
 
     The stash is inserted after ``insert_after``: the layer's commit (see
     ``_stash_group_commits``) or the layer's previous stash, so a layer's
-    stashes launch together and in order. ``prefetch`` is the stash's
+    stashes launch together and in order. The commit tensor is also an explicit
+    dependency, so scheduling cannot move copies into unfinished chunk compute.
+    ``prefetch`` is the stash's
     ``prefetch`` argument, set on the layer's last one. Returns the stash node
     and the ``wait_reload`` node, placed in front of the first backward
     consumer; rewiring the consumers to it is left to the caller.
@@ -2523,10 +2633,18 @@ def _insert_stash_ops(
     with gm.graph.inserting_after(handle):
         stash_node = gm.graph.call_function(
             paged_stash_ops.stash_.default,
-            args=(handle, node, plan.num_tokens_node, plan.slot.slot_id, prefetch),
+            args=(
+                handle,
+                node,
+                plan.num_tokens_node,
+                plan.slot.slot_id,
+                prefetch,
+                [commit],
+            ),
         )
         stash_node.meta.update(src_meta)
         stash_node.meta["val"] = None
+        _annotate_paging(stash_node, "stash")
 
     # Backward: page the activation back in just before its first consumer.
     with gm.graph.inserting_before(plan.offload.first_bwd_consumer):
@@ -2538,23 +2656,28 @@ def _insert_stash_ops(
                 plan.slot.slot_id,
                 list(val.size()),
                 val.dtype,
+                [],
             ),
         )
         reload_node.meta.update(src_meta)
         reload_node.meta["val"] = val
         reload_node.meta["autograd_backward"] = True
+        _annotate_paging(reload_node, "reload")
 
         reload_wait = gm.graph.call_function(
             paged_stash_ops.wait_reload.default,
-            args=(reload_node,),
+            args=(reload_node, [handle, plan.num_tokens_node]),
         )
         reload_wait.meta.update(src_meta)
         reload_wait.meta["val"] = val
         reload_wait.meta["autograd_backward"] = True
+        _annotate_paging(reload_wait, "wait")
     return stash_node, reload_wait
 
 
-def _insert_group_start(gm: torch.fx.GraphModule, hidden: Node) -> Node | None:
+def _insert_group_start(
+    gm: torch.fx.GraphModule, hidden: Node, *, dependencies: list[Node]
+) -> Node | None:
     """Route the expert MLP's reads of the dispatch output ``hidden`` through a
     ``group_start`` placed just before the first of them.
 
@@ -2571,9 +2694,12 @@ def _insert_group_start(gm: torch.fx.GraphModule, hidden: Node) -> Node | None:
     if not readers:
         return None
     with gm.graph.inserting_before(min(readers, key=order.__getitem__)):
-        start = gm.graph.call_function(paged_stash_ops.group_start.default, (hidden,))
+        start = gm.graph.call_function(
+            paged_stash_ops.group_start.default, (hidden, dependencies)
+        )
     start.meta.update(_meta_from(hidden))
     start.meta["val"] = hidden.meta["val"]
+    _annotate_paging(start, "wait_stash")
     for reader in readers:
         reader.replace_input_with(hidden, start)
     return start
@@ -2599,7 +2725,7 @@ def _dispatch_backward(dispatch: Node) -> Node | None:
 
 
 def _insert_reload_next(
-    gm: torch.fx.GraphModule, hidden: Node, slot_id: int, prefetch: int
+    gm: torch.fx.GraphModule, dispatch: Node, slot_id: int, prefetch: int
 ) -> Node | None:
     """Pass the gradient of the dispatch output ``hidden`` through a
     ``reload_next`` as soon as the expert MLP's backward has produced it, on its
@@ -2608,7 +2734,7 @@ def _insert_reload_next(
     Returns the ``reload_next`` node, or None if the dispatch's backward is not
     in the graph.
     """
-    dispatch_backward = _dispatch_backward(hidden.args[0])
+    dispatch_backward = _dispatch_backward(dispatch)
     if dispatch_backward is None or not isinstance(dispatch_backward.args[0], Node):
         return None
     grad = dispatch_backward.args[0]
@@ -2619,14 +2745,44 @@ def _insert_reload_next(
     )
     with anchor:
         node = gm.graph.call_function(
-            paged_stash_ops.reload_next.default, (grad, slot_id, prefetch)
+            paged_stash_ops.reload_next.default, (grad, slot_id, prefetch, [])
         )
     # The dispatch backward's metadata, not the gradient's: an accumulated
     # gradient is a bare ``add`` that carries no module annotation.
     node.meta.update(_meta_from(dispatch_backward))
     node.meta["val"] = grad.meta.get("val")
+    _annotate_paging(node, "prefetch")
     dispatch_backward.replace_input_with(grad, node)
+    wait = _exchange_wait(dispatch_backward)
+    if wait is not None:
+        wait.replace_input_with(grad, node)
     return node
+
+
+def _thread_paging_dependencies(gm: torch.fx.GraphModule) -> None:
+    """Preserve paging issue order through existing handle/result tensors.
+
+    Paging shares one host queue and GPU freelist. Data edges must survive
+    compilation, not just an FX node reorder; dependency values are not read
+    on GPU, so chaining them adds no kernel or completion wait.
+    """
+    queue_targets = {
+        paged_stash_ops.stash_.default,
+        paged_stash_ops.reload.default,
+        paged_stash_ops.group_start.default,
+        paged_stash_ops.reload_next.default,
+    }
+    previous = None
+    for node in gm.graph.nodes:
+        if node.target not in queue_targets:
+            continue
+        dependencies = list(node.args[-1])
+        if previous is not None:
+            dependencies.append(previous)
+        node.args = (*node.args[:-1], list(dict.fromkeys(dependencies)))
+        previous = (
+            node.args[0] if node.target is paged_stash_ops.stash_.default else node
+        )
 
 
 def apply_paged_stash_pass(
@@ -2635,6 +2791,7 @@ def apply_paged_stash_pass(
     *,
     page_size: int = 64,
     prefetch_lookahead: int = 1,
+    skip_immediate_backward: bool = False,
 ) -> torch.fx.GraphModule:
     """Insert paged stash/reload ops for nodes tagged ``paged_stash``.
 
@@ -2647,6 +2804,8 @@ def apply_paged_stash_pass(
             backward its reloads are issued, across pipeline actions. 1 is
             Megatron's; 0 pops each activation's pages when backward first
             reads it.
+        skip_immediate_backward: Keep the last non-pipeline paged layer's
+            activations as graph values instead of hidden resident references.
 
     Returns:
         The transformed GraphModule.
@@ -2655,32 +2814,50 @@ def apply_paged_stash_pass(
     if not tagged:
         return gm
 
-    PagedStashManager.get_instance().page_size = page_size
+    manager = PagedStashManager.get_instance()
+    manager.page_size = page_size
+    if skip_immediate_backward:
+        assert manager._pp_actions is None, "Static residency requires a joint step"
+        resident_layer = max(_stash_group(node)[0] for node in tagged)
+        for node in gm.graph.nodes:
+            if _get_layer_id(node) == resident_layer:
+                node.meta.pop(PAGED_STASH_TAG, None)
+                node.meta.get("custom", {}).pop(PAGED_STASH_REGION, None)
+        tagged = [node for node in tagged if _stash_group(node)[0] != resident_layer]
+        # Residency is represented in this graph on every trace, not chosen
+        # again by a runtime queue that the compiler cannot see.
+        manager.skip_immediate_backward = False
+        if not tagged:
+            return gm
     token_counts = find_layer_token_counts(gm)
     plans, node_to_index = _plan_stashes(gm, tagged, token_counts)
     commits = _stash_group_commits(plans, node_to_index)
-    # Each layer's last plan, whose stash ends the group.
+    # Commits are chunk-local; prefetch advances once after the whole layer.
     last_plans = {plan.slot.layer_id: plan for plan in plans}
-    last_stash: dict[int, Node] = {}
+    last_stash: dict[_StashGroup, Node] = {}
+    stash_inputs: dict[int, list[Node]] = defaultdict(list)
 
     stashed_bytes = 0
     replay_count = 0
     for plan in plans:
         layer_id = plan.slot.layer_id
-        commit = commits[layer_id]
+        group = plan.slot.group
+        commit = commits[group]
         assert node_to_index[commit] < node_to_index[plan.offload.first_bwd_consumer], (
             f"paged stash: layer {layer_id} launches its stashes at "
             f"{commit.name}, after {plan.offload.node.name}'s first backward "
             f"reader {plan.offload.first_bwd_consumer.name}; the joint graph "
             "must trace forward before backward."
         )
-        last_stash[layer_id], reloaded = _insert_stash_ops(
+        last_stash[group], reloaded = _insert_stash_ops(
             gm,
             plan,
             page_size=page_size,
             prefetch=prefetch_lookahead if plan is last_plans[layer_id] else 0,
-            insert_after=last_stash.get(layer_id, commit),
+            commit=commit,
+            insert_after=last_stash.get(group, commit),
         )
+        stash_inputs[layer_id].extend(last_stash[group].args[:3])
         if _redirect_backward_consumers(gm, plan.offload, reloaded, node_to_index):
             replay_count += 1
 
@@ -2696,11 +2873,26 @@ def apply_paged_stash_pass(
         )
 
     unanchored = []
+    layer_starts = {}
+    for (layer_id, _), counts in token_counts.items():
+        layer_starts.setdefault(layer_id, counts)
+    pending = []
+    for layer_id, counts in layer_starts.items():
+        _insert_group_start(gm, counts.hidden_node, dependencies=pending)
+        pending = stash_inputs.get(layer_id, [])
+    if pending:
+        first_reload = next(
+            node
+            for node in gm.graph.nodes
+            if node.target is paged_stash_ops.reload.default
+        )
+        first_reload.args = (*first_reload.args[:-1], pending)
     for layer_id, plan in last_plans.items():
-        hidden = token_counts[layer_id].hidden_node
-        _insert_group_start(gm, hidden)
+        counts = token_counts[plan.slot.group]
         if prefetch_lookahead > 0 and (
-            _insert_reload_next(gm, hidden, plan.slot.slot_id, prefetch_lookahead)
+            _insert_reload_next(
+                gm, counts.dispatch_node, plan.slot.slot_id, prefetch_lookahead
+            )
             is None
         ):
             unanchored.append(layer_id)
@@ -2712,6 +2904,7 @@ def apply_paged_stash_pass(
             unanchored,
         )
 
+    _thread_paging_dependencies(gm)
     _warn_unpaged_padded_activations(gm)
     gm.graph.lint()
     gm.recompile()
@@ -2742,10 +2935,17 @@ def _warn_unpaged_padded_activations(gm: torch.fx.GraphModule) -> None:
     for node in gm.graph.nodes:
         if PAGED_STASH_REGION not in node.meta.get("custom", {}):
             continue
-        counts = token_counts.get(_get_layer_id(node))
+        counts = token_counts.get(_stash_group(node))
         if counts is None or not _is_pageable(node, counts.padded):
             continue
-        _, has_backward = _get_storage_chain(node, is_view=_is_stash_view)
+        _, has_backward = _get_storage_chain(
+            node,
+            is_view=_is_stash_view,
+            is_backward=lambda user: (
+                _is_backward_node(user)
+                and user.meta.get("custom", {}).get(_PAGING_OPERATION) is None
+            ),
+        )
         if has_backward:
             unpaged.append(node)
     if unpaged:
@@ -3112,6 +3312,9 @@ def moe_expert_biases(model_parts: Sequence[nn.Module]) -> list[torch.Tensor]:
     return biases
 
 
+_ResultT = TypeVar("_ResultT")
+
+
 class PagedStashRunner:
     """Run one forward/backward step with paged-stash overflow recovery.
 
@@ -3471,15 +3674,28 @@ class PagedStashRunner:
     # ------------------------------------------------------------------
     # Step entry points
     # ------------------------------------------------------------------
-    def __call__(self, fwd_bwd_fn: Callable[[], torch.Tensor]) -> torch.Tensor:
+    def __call__(self, fwd_bwd_fn: Callable[[], _ResultT]) -> _ResultT:
         """Run ``fwd_bwd_fn`` under the configured overflow policy."""
         if not self.manager.enabled:
             return fwd_bwd_fn()
-        if self.overflow_check == "blocking":
-            return self._call_blocking(fwd_bwd_fn)
-        return self._call_deferred(fwd_bwd_fn)
+        return self.run(lambda: self.run_attempt(fwd_bwd_fn))
 
-    def _run_attempt(self, fwd_bwd_fn: Callable[[], torch.Tensor]) -> torch.Tensor:
+    def run(self, run_attempt_fn: Callable[[], _ResultT]) -> _ResultT:
+        """Monitor a GPU step outside its optional whole-FB CUDA capture.
+
+        The callable includes stash reset and forward/backward. Host event
+        polling and asynchronous overflow reporting surround it, so they run
+        on every replay without becoming operations inside the CUDA graph.
+        """
+        if not self.manager.enabled:
+            return run_attempt_fn()
+        return (
+            self._call_blocking(run_attempt_fn)
+            if self.overflow_check == "blocking"
+            else self._call_deferred(run_attempt_fn)
+        )
+
+    def run_attempt(self, fwd_bwd_fn: Callable[[], _ResultT]) -> _ResultT:
         """Reset the stash and the over-budget probes, then run ``fwd_bwd_fn``."""
         self.manager.begin_step()
         for probe in self.overbudget_probes:
@@ -3489,16 +3705,16 @@ class PagedStashRunner:
         warmup_paged_stash_kernels()
         return fwd_bwd_fn()
 
-    def _call_deferred(self, fwd_bwd_fn: Callable[[], torch.Tensor]) -> torch.Tensor:
+    def _call_deferred(self, run_attempt_fn: Callable[[], _ResultT]) -> _ResultT:
         # Read an earlier step's verdict if its copy has landed; never blocks.
         self._handle_deferred_verdict(self._take_verdict(blocking=False))
-        result = self._run_attempt(fwd_bwd_fn)
+        result = run_attempt_fn()
         if self.manager.active:
             self._enqueue_probe()
         self._snapshot_expert_biases()
         return result
 
-    def _call_blocking(self, fwd_bwd_fn: Callable[[], torch.Tensor]) -> torch.Tensor:
+    def _call_blocking(self, run_attempt_fn: Callable[[], _ResultT]) -> _ResultT:
         """Megatron's ``PagedStashRunner.__call__``: read the verdict at the end
         of every attempt, and rerun an overflowing step once with paging
         disabled."""
@@ -3509,7 +3725,7 @@ class PagedStashRunner:
                 f"PagedStashRunner: {attempts} attempts exceeded the maximum "
                 f"of {self.max_attempts}."
             )
-            result = self._run_attempt(fwd_bwd_fn)
+            result = run_attempt_fn()
             # Nothing was paged in the measure step or a rerun, so there is no
             # verdict to reach.
             overflow_ranks = 0

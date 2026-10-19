@@ -703,7 +703,7 @@ def _fake_experts_graph(*, fused_mxfp8: bool = False):
         "dispatch",
         call(
             torch.ops.hybridep.dispatch.default,
-            (tokens, tokens, tokens, 8, 2, "ep", True, 1.0, None),
+            (tokens, tokens, tokens, 8, 2, "ep", padded, None, False),
         ),
     )
     # Autograd numbers the dispatch; its backward carries the same number.
@@ -888,9 +888,12 @@ def test_annotated_region_is_paged(manager, caplog, expert_mlp):
     with caplog.at_level("WARNING"):
         apply_paged_stash_pass(gm, None, page_size=PAGE_SIZE, prefetch_lookahead=0)
     assert "unpaged" not in caplog.text
-    assert not [
-        user for node in originals for user in node.users if _is_backward_node(user)
-    ], "backward still reads a padded original"
+    assert all(
+        user.target is torch.ops.paged_stash.reload.default and node in user.args[-1]
+        for node in originals
+        for user in node.users
+        if _is_backward_node(user)
+    ), "backward reads a padded original instead of retaining only a copy keepalive"
     targets = [node.target for node in gm.graph.nodes]
     ops = torch.ops.paged_stash
     assert targets.count(ops.stash_.default) == len(paged)
@@ -935,18 +938,20 @@ def test_pass_places_megatron_stash_points(manager):
     nodes = list(gm.graph.nodes)
 
     (start,) = [node for node in nodes if node.target is ops.group_start.default]
-    assert start.args == (n["x"],)
+    assert start.args == (n["x"], [])
     assert nodes[nodes.index(start) + 1] is min(readers, key=nodes.index)
     assert all(start in reader.all_input_nodes for reader in readers)
     assert {user.target for user in n["x"].users} == {
         ops.group_start.default,
         ops.stash_.default,
+        ops.reload.default,
     }
 
     stashes = [node for node in nodes if node.target is ops.stash_.default]
     order = ("x", "gate_up", "silu", "h", "out")
     assert [stash.args[1] for stash in stashes] == [n[name] for name in order]
     assert [stash.args[4] for stash in stashes] == [0, 0, 0, 0, 1]
+    assert all(n["out"] in stash.args[-1] for stash in stashes)
     first, last = nodes.index(stashes[0]), nodes.index(stashes[-1])
     assert first > nodes.index(n["out"]), "launched before the MLP finished"
     launch_ops = (ops.stash_.default, torch.ops.aten.empty.memory_format)

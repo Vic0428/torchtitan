@@ -432,6 +432,7 @@ class TestGraphTrainerNumerics(unittest.TestCase):
         """Compare real four-rank training through the production entry point."""
         for target in (
             "deepseek_v3_hybridep_overlap",
+            "deepseek_v3_hybridep_overlap_paged",
         ):
             with self.subTest(target=target):
                 self.assertTrue(

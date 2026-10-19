@@ -207,6 +207,34 @@ def _plan_order(
     deps = _graph_dependencies(gm)
     launches = set()
     waits = set()
+    from torchtitan.experiments.graph_trainer.paged_stash_memory_policy import (
+        _PAGING_OPERATION,
+    )
+
+    paging_targets = {
+        "stash": torch.ops.paged_stash.stash_.default,
+        "reload": torch.ops.paged_stash.reload.default,
+        "prefetch": torch.ops.paged_stash.reload_next.default,
+        "wait": torch.ops.paged_stash.wait_reload.default,
+        "wait_stash": torch.ops.paged_stash.group_start.default,
+    }
+    previous_paging = None
+    for node in gm.graph.nodes:
+        operation = _custom_meta(node).get(_PAGING_OPERATION)
+        if operation is None:
+            continue
+        if operation not in paging_targets or node.target != paging_targets[operation]:
+            raise ValueError(f"Invalid paging annotation on {node.name}: {operation}")
+        if operation in ("wait", "wait_stash"):
+            waits.add(node)
+        else:
+            launches.add(node)
+        # The manager's queue and shared freelist are one explicit resource.
+        # Keep their original issue order; per-reload waits depend on data only.
+        if operation != "wait":
+            if previous_paging is not None:
+                deps[node].add(previous_paging)
+            previous_paging = node
     for region, chunk_exchanges in zip(regions, exchanges, strict=True):
         chunk_order = (1, 0) if region.is_backward else (0, 1)
         for first, second in zip(
