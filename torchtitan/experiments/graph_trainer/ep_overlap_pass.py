@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import operator
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -58,82 +59,92 @@ def _custom_meta(node: fx.Node) -> dict[str, Any]:
     return node.meta.get("custom", {})
 
 
-def _collect_exchanges(region: ChunkedRegion) -> dict[int, tuple[_TokenExchange, ...]]:
-    """Validate annotated native launch/wait pairs for both chunk bodies."""
+def _collect_native_exchanges(
+    nodes: Iterable[fx.Node], *, context: str
+) -> tuple[_TokenExchange, ...]:
+    """Validate source-annotated native exchanges without assuming chunking."""
     allowed_launches = {
         torch.ops.hybridep.dispatch.default: "dispatch",
         torch.ops.hybridep.combine.default: "combine",
         torch.ops.hybridep.dispatch_bwd.default: "dispatch",
         torch.ops.hybridep.combine_bwd.default: "combine",
     }
+    launches = {}
+    waits = {}
+    for node in nodes:
+        # Tuple projections inherit traceback annotations, but are not ops.
+        if node.op != "call_function" or not isinstance(
+            node.target, torch._ops.OpOverload
+        ):
+            continue
+        custom = _custom_meta(node)
+        phase = custom.get(_EP_TOKEN_EXCHANGE)
+        wait_phase = custom.get(_EP_TOKEN_EXCHANGE_WAIT)
+        if phase is not None:
+            if allowed_launches.get(node.target) != phase:
+                raise ValueError(
+                    f"Invalid EP launch annotation on {node.name}: {node.target}"
+                )
+            launches[node] = phase
+        if wait_phase is not None:
+            if node.target != torch.ops.hybridep.wait.default:
+                raise ValueError(
+                    f"Invalid EP wait annotation on {node.name}: {node.target}"
+                )
+            request = node.args[1]
+            if not (
+                isinstance(request, fx.Node)
+                and request.target is operator.getitem
+                and isinstance(request.args[0], fx.Node)
+            ):
+                raise ValueError(
+                    f"EP wait {node.name} must consume a launch's completion request"
+                )
+            launch = request.args[0]
+            inputs = {
+                input_node
+                for input_node in launch.all_input_nodes
+                if isinstance(input_node.meta.get("val"), torch.Tensor)
+            }
+            if set(node.args[2]) != inputs:
+                raise ValueError(
+                    f"EP wait {node.name} must retain every tensor input of "
+                    f"{launch.name}; compiler reuse cannot see opaque references"
+                )
+            if request.args[1] != len(launch.target._schema.returns) - 1:
+                raise ValueError(
+                    f"EP wait {node.name} does not consume the completion output"
+                )
+            if launch in waits:
+                raise ValueError(
+                    f"EP launch {launch.name} has multiple completion waits"
+                )
+            waits[launch] = (node, wait_phase)
+    if set(launches) != set(waits):
+        missing = set(launches) ^ set(waits)
+        raise ValueError(
+            f"{context} has unmatched EP launches/waits: "
+            f"{[node.name for node in missing]}. Enable non-blocking HybridEP async_op."
+        )
+    exchanges = []
+    for launch, phase in launches.items():
+        wait, wait_phase = waits[launch]
+        if phase != wait_phase:
+            raise ValueError(
+                f"EP launch/wait phase mismatch: {launch.name} -> {wait.name}"
+            )
+        exchanges.append(_TokenExchange(phase, launch, wait))
+    return tuple(exchanges)
+
+
+def _collect_exchanges(region: ChunkedRegion) -> dict[int, tuple[_TokenExchange, ...]]:
+    """Require one dispatch/combine pair in each annotated eager chunk."""
     exchanges = {}
     for chunk_id, body in region.bodies_by_chunk.items():
-        launches = {}
-        waits = {}
-        for node in body.nodes:
-            # Tuple projections inherit traceback annotations, but are not ops.
-            if node.op != "call_function" or not isinstance(
-                node.target, torch._ops.OpOverload
-            ):
-                continue
-            custom = _custom_meta(node)
-            phase = custom.get(_EP_TOKEN_EXCHANGE)
-            wait_phase = custom.get(_EP_TOKEN_EXCHANGE_WAIT)
-            if phase is not None:
-                if allowed_launches.get(node.target) != phase:
-                    raise ValueError(
-                        f"Invalid EP launch annotation on {node.name}: {node.target}"
-                    )
-                launches[node] = phase
-            if wait_phase is not None:
-                if node.target != torch.ops.hybridep.wait.default:
-                    raise ValueError(
-                        f"Invalid EP wait annotation on {node.name}: {node.target}"
-                    )
-                request = node.args[1]
-                if not (
-                    isinstance(request, fx.Node)
-                    and request.target is operator.getitem
-                    and isinstance(request.args[0], fx.Node)
-                ):
-                    raise ValueError(
-                        f"EP wait {node.name} must consume a launch's completion request"
-                    )
-                launch = request.args[0]
-                inputs = {
-                    input_node
-                    for input_node in launch.all_input_nodes
-                    if isinstance(input_node.meta.get("val"), torch.Tensor)
-                }
-                if set(node.args[2]) != inputs:
-                    raise ValueError(
-                        f"EP wait {node.name} must retain every tensor input of "
-                        f"{launch.name}; compiler reuse cannot see opaque references"
-                    )
-                if request.args[1] != len(launch.target._schema.returns) - 1:
-                    raise ValueError(
-                        f"EP wait {node.name} does not consume the completion output"
-                    )
-                if launch in waits:
-                    raise ValueError(
-                        f"EP launch {launch.name} has multiple completion waits"
-                    )
-                waits[launch] = (node, wait_phase)
-        if set(launches) != set(waits):
-            missing = set(launches) ^ set(waits)
-            raise ValueError(
-                f"EP region {region.root_fqn}, chunk {chunk_id}, has unmatched "
-                f"launches/waits: {[node.name for node in missing]}"
-            )
-        chunk_exchanges = []
-        for launch, phase in launches.items():
-            wait, wait_phase = waits[launch]
-            if phase != wait_phase:
-                raise ValueError(
-                    f"EP launch/wait phase mismatch: {launch.name} -> {wait.name}"
-                )
-            chunk_exchanges.append(_TokenExchange(phase, launch, wait))
-        if len(chunk_exchanges) != 2 or set(launches.values()) != {
+        chunk_exchanges = _collect_native_exchanges(
+            body.nodes, context=f"EP region {region.root_fqn}, chunk {chunk_id}"
+        )
+        if len(chunk_exchanges) != 2 or {item.phase for item in chunk_exchanges} != {
             "dispatch",
             "combine",
         }:
@@ -141,7 +152,7 @@ def _collect_exchanges(region: ChunkedRegion) -> dict[int, tuple[_TokenExchange,
                 f"EP region {region.root_fqn}, chunk {chunk_id}, requires "
                 "one dispatch and one combine with explicit completion waits"
             )
-        exchanges[chunk_id] = tuple(chunk_exchanges)
+        exchanges[chunk_id] = chunk_exchanges
     signatures = {
         chunk: tuple((exchange.phase, exchange.launch.target) for exchange in values)
         for chunk, values in exchanges.items()
@@ -154,8 +165,12 @@ def _collect_exchanges(region: ChunkedRegion) -> dict[int, tuple[_TokenExchange,
 
 
 def _graph_dependencies(gm: fx.GraphModule) -> dict[fx.Node, set[fx.Node]]:
-    """Preserve data edges and original read/write ordering of mutable storage."""
+    """Preserve positional arguments, data edges and mutable-storage ordering."""
     deps = {node: set(node.all_input_nodes) for node in gm.graph.nodes}
+    # Positional input order is the callable ABI, not a tensor dependency.
+    placeholders = gm.graph.find_nodes(op="placeholder")
+    for first, second in zip(placeholders, placeholders[1:]):
+        deps[second].add(first)
     mutators_by_base = mutation_deps(gm.graph)
     mutable_bases = set(mutators_by_base)
     readers: dict[fx.Node, set[fx.Node]] = {}
@@ -197,14 +212,70 @@ def _region_scope(
     return scope
 
 
-def _plan_order(
-    gm: fx.GraphModule,
-    regions: list[ChunkedRegion],
-    exchanges: list[dict[int, tuple[_TokenExchange, ...]]],
+def _prioritized_order(
+    deps: dict[fx.Node, set[fx.Node]],
+    *,
+    order: dict[fx.Node, int],
+    launches: set[fx.Node],
+    waits: set[fx.Node],
+    regions: list[tuple[set[fx.Node], set[fx.Node]]],
+    yield_to: dict[fx.Node, set[fx.Node]] | None = None,
 ) -> list[fx.Node]:
-    """Choose the earliest legal launches and postpone waits behind ready work."""
-    order = ordered_nodes(gm)
-    deps = _graph_dependencies(gm)
+    """Topologically schedule ordered scopes with early launches and late waits.
+
+    Each region contains its eligible scope and the owned body whose completion
+    advances to the next region. A multiplexed pair uses one whole-graph scope.
+    Optional launch boundaries prefer complementary work among equally ranked
+    ready nodes, preventing one source from draining all its completion waits.
+    """
+    successors: dict[fx.Node, list[fx.Node]] = {node: [] for node in deps}
+    for node, predecessors in deps.items():
+        for predecessor in predecessors:
+            successors[predecessor].append(node)
+    remaining = {node: len(predecessors) for node, predecessors in deps.items()}
+    ready = {node for node, count in remaining.items() if not count}
+    emitted = set()
+    result = []
+    active_region = 0
+    preferred = set()
+    while ready:
+        while active_region < len(regions) and regions[active_region][1] <= emitted:
+            active_region += 1
+        scoped_ready = (
+            ready & regions[active_region][0] if active_region < len(regions) else set()
+        )
+        if scoped_ready:
+            node = min(
+                scoped_ready,
+                key=lambda candidate: (
+                    0 if candidate in launches else 2 if candidate in waits else 1,
+                    candidate not in preferred,
+                    order[candidate],
+                ),
+            )
+        else:
+            node = min(ready, key=order.__getitem__)
+        ready.remove(node)
+        emitted.add(node)
+        result.append(node)
+        if yield_to is not None and node in yield_to:
+            preferred = yield_to[node]
+        for successor in successors[node]:
+            remaining[successor] -= 1
+            if remaining[successor] == 0:
+                ready.add(successor)
+    if len(result) != len(deps):
+        blocked = [node.name for node in deps if node not in emitted]
+        raise ValueError(
+            f"Communication scheduling dependencies contain a cycle: {blocked[:8]}"
+        )
+    return result
+
+
+def _paging_dependencies(
+    gm: fx.GraphModule, deps: dict[fx.Node, set[fx.Node]]
+) -> tuple[set[fx.Node], set[fx.Node]]:
+    """Validate paging roles and preserve its single queue/freelist issue order."""
     launches = set()
     waits = set()
     from torchtitan.experiments.graph_trainer.paged_stash_memory_policy import (
@@ -235,6 +306,18 @@ def _plan_order(
             if previous_paging is not None:
                 deps[node].add(previous_paging)
             previous_paging = node
+    return launches, waits
+
+
+def _plan_order(
+    gm: fx.GraphModule,
+    regions: list[ChunkedRegion],
+    exchanges: list[dict[int, tuple[_TokenExchange, ...]]],
+) -> list[fx.Node]:
+    """Choose the earliest legal launches and postpone waits behind ready work."""
+    order = ordered_nodes(gm)
+    deps = _graph_dependencies(gm)
+    launches, waits = _paging_dependencies(gm, deps)
     for region, chunk_exchanges in zip(regions, exchanges, strict=True):
         chunk_order = (1, 0) if region.is_backward else (0, 1)
         for first, second in zip(
@@ -257,42 +340,13 @@ def _plan_order(
         {node for body in region.bodies_by_chunk.values() for node in body.nodes}
         for region in regions
     ]
-    successors: dict[fx.Node, list[fx.Node]] = {node: [] for node in deps}
-    for node, predecessors in deps.items():
-        for predecessor in predecessors:
-            successors[predecessor].append(node)
-    remaining = {node: len(predecessors) for node, predecessors in deps.items()}
-    ready = {node for node, count in remaining.items() if not count}
-    emitted = set()
-    result = []
-    active_region = 0
-    while ready:
-        while active_region < len(regions) and body_nodes[active_region] <= emitted:
-            active_region += 1
-        scoped_ready = (
-            ready & scopes[active_region] if active_region < len(regions) else set()
-        )
-        if scoped_ready:
-            node = min(
-                scoped_ready,
-                key=lambda candidate: (
-                    0 if candidate in launches else 2 if candidate in waits else 1,
-                    order[candidate],
-                ),
-            )
-        else:
-            node = min(ready, key=order.__getitem__)
-        ready.remove(node)
-        emitted.add(node)
-        result.append(node)
-        for successor in successors[node]:
-            remaining[successor] -= 1
-            if remaining[successor] == 0:
-                ready.add(successor)
-    if len(result) != len(deps):
-        blocked = [node.name for node in deps if node not in emitted]
-        raise ValueError(f"EP scheduling dependencies contain a cycle: {blocked[:8]}")
-    return result
+    return _prioritized_order(
+        deps,
+        order=order,
+        launches=launches,
+        waits=waits,
+        regions=list(zip(scopes, body_nodes, strict=True)),
+    )
 
 
 def _validated_regions(

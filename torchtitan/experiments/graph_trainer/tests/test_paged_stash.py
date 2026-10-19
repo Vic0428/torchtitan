@@ -889,7 +889,8 @@ def test_annotated_region_is_paged(manager, caplog, expert_mlp):
         apply_paged_stash_pass(gm, None, page_size=PAGE_SIZE, prefetch_lookahead=0)
     assert "unpaged" not in caplog.text
     assert all(
-        user.target is torch.ops.paged_stash.reload.default and node in user.args[-1]
+        user.target is torch.ops.paged_stash.group_start.default
+        and node in user.args[-1]
         for node in originals
         for user in node.users
         if _is_backward_node(user)
@@ -937,15 +938,33 @@ def test_pass_places_megatron_stash_points(manager):
     apply_paged_stash_pass(gm, None, page_size=PAGE_SIZE, prefetch_lookahead=1)
     nodes = list(gm.graph.nodes)
 
-    (start,) = [node for node in nodes if node.target is ops.group_start.default]
+    (start,) = [
+        node
+        for node in nodes
+        if node.target is ops.group_start.default and not _is_backward_node(node)
+    ]
     assert start.args == (n["x"], [])
     assert nodes[nodes.index(start) + 1] is min(readers, key=nodes.index)
     assert all(start in reader.all_input_nodes for reader in readers)
     assert {user.target for user in n["x"].users} == {
         ops.group_start.default,
         ops.stash_.default,
-        ops.reload.default,
     }
+    (join,) = [
+        node
+        for node in nodes
+        if node.target is ops.group_start.default and _is_backward_node(node)
+    ]
+    reloads = [node for node in nodes if node.target is ops.reload.default]
+    assert reloads[0].args[0] is join
+    assert all(
+        n[name] in join.args[-1] for name in ("x", "gate_up", "silu", "h", "out")
+    )
+    assert all(
+        n[name] not in reload.all_input_nodes
+        for reload in reloads
+        for name in ("x", "gate_up", "silu", "h", "out")
+    ), "functional reload directly retains an input it may return during calibration"
 
     stashes = [node for node in nodes if node.target is ops.stash_.default]
     order = ("x", "gate_up", "silu", "h", "out")

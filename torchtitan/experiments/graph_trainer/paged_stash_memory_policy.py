@@ -198,8 +198,9 @@ Limitations
   token-ordered, as Transformer Engine's do in Megatron. A tensor no shape shows
   token rows for is left to SAC; if backward then rebuilds it from a padded
   input, that input crosses into backward unpaged, and a warning names it.
-- GraphTrainer's GraphPP runtime does not capture CUDA graphs yet, so a single
-  run exercises either the CUDA-graph path or the GraphPP path, not both.
+- GraphTrainer captures the complete pipeline forward/backward step. Its fixed
+  schedule decisions and distinct microbatch handles can be captured together;
+  capturing only one reusable stage graph cannot freeze those decisions safely.
 - With the default ``deferred`` overflow check, an overflow can surface as the
   trainer's "Loss or gradient norm is not finite" error rather than the paged
   stash one: the overflowing step's backward reads activations that were never
@@ -947,6 +948,7 @@ class PagedStashManager:
             | None
         ) = None
         self._warned_capture_schedule = False
+        self._whole_step_in_progress = False
 
         # Every stash of a slot, in stash order, until its reload: Megatron's
         # `paged_tensors_to_reload`. Records are per slot because with
@@ -1083,17 +1085,16 @@ class PagedStashManager:
     def next_entries(self, entry: ScheduleEntry, count: int = 1) -> list[ScheduleEntry]:
         """The ``count`` schedule entries that follow ``entry`` on this rank.
 
-        Empty when the answer would not survive CUDA graph replay. A captured
-        graph freezes host-side Python, so with pipeline parallelism a stage
-        graph captured at one place in the schedule would replay that place's
-        skips and prefetches -- and the stash handles they read -- for every
-        microbatch. Without pipeline parallelism the step is one graph whose
-        place never changes. Not skipping and not prefetching is correct under
-        every schedule, so that is the safe direction to fail: each stash then
-        makes the round trip and each reload pops its pages when backward
-        first reads them.
+        A complete step captures every schedule position and its distinct
+        handles together. A single reusable stage capture cannot freeze those
+        decisions for different microbatches, so that scope disables schedule
+        optimizations and reloads on demand.
         """
-        if self._pp_actions is not None and torch.cuda.is_current_stream_capturing():
+        if (
+            self._pp_actions is not None
+            and torch.cuda.is_current_stream_capturing()
+            and not self._whole_step_in_progress
+        ):
             if not self._warned_capture_schedule:
                 self._warned_capture_schedule = True
                 logger.warning(
@@ -2886,7 +2887,17 @@ def apply_paged_stash_pass(
             for node in gm.graph.nodes
             if node.target is paged_stash_ops.reload.default
         )
-        first_reload.args = (*first_reload.args[:-1], pending)
+        handle = first_reload.args[0]
+        with gm.graph.inserting_before(first_reload):
+            join = gm.graph.call_function(
+                paged_stash_ops.group_start.default, (handle, pending)
+            )
+        join.meta.update(_meta_from(first_reload))
+        join.meta["val"] = handle.meta["val"]
+        _annotate_paging(join, "wait_stash")
+        # Calibration/residency may return an original activation. Keep copy
+        # inputs through the join, not as inputs aliasing a functional reload.
+        first_reload.args = (join, *first_reload.args[1:])
     for layer_id, plan in last_plans.items():
         counts = token_counts[plan.slot.group]
         if prefetch_lookahead > 0 and (
@@ -3696,14 +3707,18 @@ class PagedStashRunner:
         )
 
     def run_attempt(self, fwd_bwd_fn: Callable[[], _ResultT]) -> _ResultT:
-        """Reset the stash and the over-budget probes, then run ``fwd_bwd_fn``."""
+        """Reset and run one complete F/B step under a fixed capture schedule."""
         self.manager.begin_step()
         for probe in self.overbudget_probes:
             probe.reset()
         # Triton compiles on first launch, which a CUDA graph capture cannot
         # tolerate; prime the cache while we are still eager.
         warmup_paged_stash_kernels()
-        return fwd_bwd_fn()
+        self.manager._whole_step_in_progress = True
+        try:
+            return fwd_bwd_fn()
+        finally:
+            self.manager._whole_step_in_progress = False
 
     def _call_deferred(self, run_attempt_fn: Callable[[], _ResultT]) -> _ResultT:
         # Read an earlier step's verdict if its copy has landed; never blocks.

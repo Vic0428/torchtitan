@@ -96,6 +96,11 @@ def run_loss_compare(
         result = subprocess.run(cmd, text=True)
         if result.returncode != 0:
             print("loss_compare.py failed")
+            for scenario in ("baseline", "test"):
+                log = Path(job_dump_folder, "comparison", f"{scenario}_training.log")
+                if log.exists():
+                    print(f"{scenario} training log tail:")
+                    print("\n".join(log.read_text().splitlines()[-40:]))
             return False
         if require_cuda_graphs:
             for scenario in ("baseline", "test"):
@@ -449,6 +454,28 @@ class TestGraphTrainerNumerics(unittest.TestCase):
                         require_cuda_graphs=True,
                     )
                 )
+
+    def test_hybridep_combined_pp_overlap_and_paging(self):
+        """Compare real PP2/EP2 training with full pipeline CUDA replay."""
+        for target in (
+            "deepseek_v3_hybridep_combined_pp_overlap",
+            "deepseek_v3_hybridep_combined_pp_overlap_paged",
+        ):
+            self.assertTrue(
+                run_loss_compare(
+                    NUMERICS_CONFIG_MODULE,
+                    "deepseek_v3_hybridep_combined_pp_control",
+                    NUMERICS_CONFIG_MODULE,
+                    target,
+                    baseline_ngpus=4,
+                    test_ngpus=4,
+                    metrics=("loss", "grad_norm"),
+                    steps=10,
+                    use_seed_checkpoint=False,
+                    require_cuda_graphs=True,
+                ),
+                target,
+            )
 
     def test_dense_llama3_hsdp_gradient_accumulation_aot_fx_trace_vs_eager(self):
         self.assertTrue(_run_hsdp_llama3_gradient_accumulation_loss_compare())

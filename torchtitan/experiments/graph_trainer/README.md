@@ -215,6 +215,39 @@ Current limitations:
 - The token count must be even.
 - Additional overlap or sharding modes require their own loss and trace checks.
 
+### Pipeline Communication Overlap
+
+Pipeline overlap uses `Interleaved1F1BCombined` and graph multiplexing, not EP
+token chunking. The schedule adds one warmup forward, then pairs an independent
+forward and backward as an explicit `OVERLAP_F_B` action. Both actions' receives
+and parameter unshards precede the pair; normal send, gradient accumulation and
+reduction ownership remain in the existing pipeline schedule.
+
+```python
+config.parallelism.pipeline_parallel_schedule = "Interleaved1F1BCombined"
+config.compile.enable_graph_pp_comm_compute_overlap = True
+config.compile.ep_overlap.enabled = False
+config.compile.inductor_compilation = "regional"
+config.training.disable_cuda_graphs = False
+```
+
+Use non-blocking `HybridEPTokenDispatcher` capacity. Enabling the GraphPP pass
+selects explicit asynchronous native launches/waits without splitting tokens
+or dividing each microbatch's capacity. Configure `sac_and_paged_stash` to
+include page operations. Source graphs retain explicit forward/backward
+ownership when multiplexed. The pass validates native request/input lifetimes,
+preserves tensor/mutation and paging queue dependencies, launches ready
+communication early and postpones waits behind independent compute.
+Each native launch gives ready work in the opposite source graph priority,
+including its ready completion waits, instead of draining one source first.
+Full CUDA capture covers the entire pipeline forward/backward step, including every
+microbatch's distinct native routing state.
+
+The pass can be disabled with `compile.disable_passes =
+["graph_pp_comm_compute_overlap_pass"]` for a same-schedule comparison. Without
+combined actions, the requested overlap emits a warning. Full-graph Inductor
+and DeepEP are outside this feature's scope.
+
 ### Experimental AutoParallel Sharding
 
 GraphTrainer can use AutoParallel to solve SPMD placement for supported models,
