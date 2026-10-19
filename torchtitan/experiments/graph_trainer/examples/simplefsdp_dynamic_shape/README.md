@@ -16,6 +16,7 @@ count of every tensor is known before the graph runs.
 | `symbolic_walkthrough.py` | Single-GPU, no FSDP. It traces forward + loss of one small block with `mark_dynamic`, then prints the symbol for each input, the shape of each node, the ShapeEnv guards, and the generated code. It also shows that a Python branch on the symbol adds a guard, and that `run_traced` then runs a T outside the guarded range without an error. |
 | `custom_op_memory.py` | Single GPU. A custom op allocates a hidden workspace inside its real kernel. The FakeTensor memory estimate misses it, and the gap to the measured peak is exactly the workspace size. |
 | `path_dependent_shapes.py` | Single GPU. A buffer whose shape depends on a branch on T, written four ways: Python `if` (`mark_dynamic` / `mark_unbacked`), `torch.sym_ite`, `torch.cond`, and `torch.compile`. It shows which form keeps both paths, which adds a guard, and what the memory expression becomes. |
+| `inductor_wrapper_memory.py` | Tool, no GPU. Walks the `call()` body of Inductor wrapper code and gives the live bytes after each allocation as an expression of T. On the dynamic graph of `shape_demo.py` it matches the per-line `memory_allocated` exactly at T = 1024, 4096 and 8192. It does not count memory used inside a kernel, such as the cuBLAS workspace of `extern_kernels.mm`. |
 | `recipe.py` | `simplefsdp_llama3_fsdp4`: the llama3 debug model on graph_trainer with FSDP=4 and flex attention, 10 steps. It is the normal (static-shape) training path. |
 
 ## Run
@@ -40,6 +41,12 @@ python -m \
 # Path-dependent buffer shapes, 1 GPU.
 python -m \
     torchtitan.experiments.graph_trainer.examples.simplefsdp_dynamic_shape.path_dependent_shapes
+
+# Peak memory of Inductor wrapper code, as a function of T. Get the wrapper
+# path from "Output code written to: ..." with TORCH_LOGS=output_code.
+python -m \
+    torchtitan.experiments.graph_trainer.examples.simplefsdp_dynamic_shape.inductor_wrapper_memory \
+    <wrapper.py> 1024 4096 8192
 
 # Normal training, 4 GPUs.
 NGPU=4 \
