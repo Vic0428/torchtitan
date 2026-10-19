@@ -15,6 +15,7 @@ count of every tensor is known before the graph runs.
 | `shape_demo.py` | Standalone 2-GPU demo. It traces a small LM with SimpleFSDP twice: once with static shapes, once with `torch._dynamo.mark_dynamic(tokens, 0)`. It then compares the FakeTensor memory estimate with the CUDA allocator peak, and compiles both graphs with Inductor. |
 | `symbolic_walkthrough.py` | Single-GPU, no FSDP. It traces forward + loss of one small block with `mark_dynamic`, then prints the symbol for each input, the shape of each node, the ShapeEnv guards, and the generated code. It also shows that a Python branch on the symbol adds a guard, and that `run_traced` then runs a T outside the guarded range without an error. |
 | `custom_op_memory.py` | Single GPU. A custom op allocates a hidden workspace inside its real kernel. The FakeTensor memory estimate misses it, and the gap to the measured peak is exactly the workspace size. |
+| `path_dependent_shapes.py` | Single GPU. A buffer whose shape depends on a branch on T, written four ways: Python `if` (`mark_dynamic` / `mark_unbacked`), `torch.sym_ite`, `torch.cond`, and `torch.compile`. It shows which form keeps both paths, which adds a guard, and what the memory expression becomes. |
 | `recipe.py` | `simplefsdp_llama3_fsdp4`: the llama3 debug model on graph_trainer with FSDP=4 and flex attention, 10 steps. It is the normal (static-shape) training path. |
 
 ## Run
@@ -35,6 +36,10 @@ python -m \
 # Custom op hidden workspace, 1 GPU.
 python -m \
     torchtitan.experiments.graph_trainer.examples.simplefsdp_dynamic_shape.custom_op_memory
+
+# Path-dependent buffer shapes, 1 GPU.
+python -m \
+    torchtitan.experiments.graph_trainer.examples.simplefsdp_dynamic_shape.path_dependent_shapes
 
 # Normal training, 4 GPUs.
 NGPU=4 \
