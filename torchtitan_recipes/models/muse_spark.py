@@ -523,7 +523,7 @@ def _muse_spark_816b_dist_moe_bf16_spmd(
     p.num_pp_microbatches = 1
     p.fsdp_reshard_after_forward = "always"
 
-    # Compile only the elementwise regions with measured fusion wins. Activation
+    # Add the elementwise regions with measured fusion wins to the model defaults. Activation
     # remat saves the expensive inner-attention and effectful Dist-MoE outputs
     # while recomputing projections, routing preparation, norms, and pool/unpool.
     config.model.local_compile_regions.extend(
