@@ -13,6 +13,7 @@ count of every tensor is known before the graph runs.
 | File | What it does |
 |---|---|
 | `shape_demo.py` | Standalone 2-GPU demo. It traces a small LM with SimpleFSDP twice: once with static shapes, once with `torch._dynamo.mark_dynamic(tokens, 0)`. It then compares the FakeTensor memory estimate with the CUDA allocator peak, and compiles both graphs with Inductor. |
+| `symbolic_walkthrough.py` | Single-GPU, no FSDP. It traces forward + loss of one small block with `mark_dynamic`, then prints the symbol for each input, the shape of each node, the ShapeEnv guards, and the generated code. It also shows that a Python branch on the symbol adds a guard, and that `run_traced` then runs a T outside the guarded range without an error. |
 | `recipe.py` | `simplefsdp_llama3_fsdp4`: the llama3 debug model on graph_trainer with FSDP=4 and flex attention, 10 steps. It is the normal (static-shape) training path. |
 
 ## Run
@@ -25,6 +26,10 @@ Run them from the repo root.
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 torchrun --nproc_per_node=2 -m \
     torchtitan.experiments.graph_trainer.examples.simplefsdp_dynamic_shape.shape_demo
+
+# Symbol-by-symbol walkthrough, 1 GPU.
+python -m \
+    torchtitan.experiments.graph_trainer.examples.simplefsdp_dynamic_shape.symbolic_walkthrough
 
 # Normal training, 4 GPUs.
 NGPU=4 \
